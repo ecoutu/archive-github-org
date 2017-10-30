@@ -62,9 +62,14 @@ fetch_and_clone ${url}
 echo "Archiving repos to ./${archive_name}"
 tar czvf "../${archive_name}" .
 
-echo "Sending archive ${archive_name} to s3 bucket ${s3_bucket}"
-aws s3 cp "../${archive_name}" "${s3_bucket}"
+if [[ ! -z "${s3_bucket}" ]]; then
+  echo "Sending archive ${archive_name} to s3 bucket ${s3_bucket}"
+  aws s3 cp "../${archive_name}" "${s3_bucket}"
+
+  rm -rf "/tmp/${archive_name}"
+fi
+
+rm -rf "${tmp_path}"
 
 popd
 
-rm -rf "/tmp/${archive_name}" "${tmp_path}"
