@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+
+# Enable strict error handling
+set -euo pipefail
+
+# Enable debug mode if DEBUG environment variable is set
+[[ "${DEBUG:-}" == "true" ]] && set -x
+
+# Color constants
+readonly BOLD='\033[1;37m'
+readonly BOLD_GREEN='\033[1;32m'
+readonly BOLD_YELLOW='\033[1;33m'
+readonly BOLD_RED='\033[1;31m'
+readonly END='\033[0m' # No Color
+
+# Script variables
+org=""
+user=""
+token="${GITHUB_TOKEN:-}"
+s3_bucket=""
+archive_name=""
+tmp_path=""
+readonly date_suffix=$(date +%s)
+
+# Cleanup function
+cleanup() {
+  local exit_code=$?
+  if [[ -n "${tmp_path:-}" && -d "${tmp_path}" ]]; then
+    echo -e "${BOLD_YELLOW}Cleaning up temporary directory: ${tmp_path}${END}" >&2
+    rm -rf "${tmp_path}"
+  fi
+  exit ${exit_code}
+}
+
+# Set up cleanup trap
+trap cleanup EXIT INT TERM
+
+show_help() {
+  echo -e "
+${BOLD}gh-repo-archive${END} - Archive all repositories from a GitHub organization or user
+
+${BOLD}USAGE:${END}
+    $0 -o <organization> [OPTIONS]
+    $0 -u <user> [OPTIONS]
+
+${BOLD}REQUIRED (choose one):${END}
+    -o, --organization <name>    GitHub organization name to archive
+    -u, --user <name>            GitHub user name to archive
+
+${BOLD}OPTIONS:${END}
+    -b, --bucket <s3_path>       S3 bucket path for uploading the archive
+    -n, --name <filename>        Custom archive filename (default: <org/user>-gh-archive-<timestamp>.tar.gz)
+    -t, --tmp <path>             Custom temporary directory path (default: /tmp/<org/user>-gh-archive-<timestamp>)
+    -h, --help                   Show this help message and exit
+
+${BOLD}ENVIRONMENT:${END}
+    GITHUB_TOKEN                 GitHub personal access token (required)
+
+${BOLD}EXAMPLES:${END}
+    # Archive organization repositories
+    export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+    $0 -o myorg
+
+    # Archive user repositories
+    export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+    $0 -u myuser
+
+    # With S3 upload
+    $0 -o myorg -b s3://my-bucket/backups/
+
+    # Custom archive name and temp directory
+    $0 -u myuser -n "custom-backup.tar.gz" -t "/home/user/temp"
+
+${BOLD}DEPENDENCIES:${END}
+    - jq (for JSON processing)
+    - curl (for API requests)
+    - git (for repository cloning)
+    - aws (for S3 upload, optional)
+
+${BOLD}TOKEN PERMISSIONS:${END}
+    Your GitHub token needs 'repo' (for private repos) or 'public_repo' (for public only)
+    and 'read:org' permissions for organizations, or 'read:user' for user repositories.
+"
+  exit 0
+}
+
+# Check for required dependencies
+check_dependencies() {
+  local missing_deps=()
+
+  command -v jq >/dev/null 2>&1 || missing_deps+=("jq")
+  command -v curl >/dev/null 2>&1 || missing_deps+=("curl")
+  command -v git >/dev/null 2>&1 || missing_deps+=("git")
+
+  if [[ ${#missing_deps[@]} -gt 0 ]]; then
+    echo -e "${BOLD_RED}Error:${END} Missing required dependencies: ${missing_deps[*]}" >&2
+    echo "Please install the missing dependencies and try again." >&2
+    echo "Use --help for more information." >&2
+    exit 1
+  fi
+}
+
+check_dependencies
+
+while (( $# )); do
+  case "${1}" in
+    -o|--organization)
+      [[ -n "${2:-}" ]] || { echo -e "${BOLD_RED}Error:${END} Option ${1} requires an argument" >&2; exit 1; }
+      org="${2}"
+      shift 2
+    ;;
+    -u|--user)
+      [[ -n "${2:-}" ]] || { echo -e "${BOLD_RED}Error:${END} Option ${1} requires an argument" >&2; exit 1; }
+      user="${2}"
+      shift 2
+    ;;
+    -b|--bucket)
+      [[ -n "${2:-}" ]] || { echo -e "${BOLD_RED}Error:${END} Option ${1} requires an argument" >&2; exit 1; }
+      s3_bucket="${2}"
+      shift 2
+    ;;
+    -n|--name)
+      [[ -n "${2:-}" ]] || { echo -e "${BOLD_RED}Error:${END} Option ${1} requires an argument" >&2; exit 1; }
+      archive_name="${2}"
+      shift 2
+    ;;
+    -t|--tmp)
+      [[ -n "${2:-}" ]] || { echo -e "${BOLD_RED}Error:${END} Option ${1} requires an argument" >&2; exit 1; }
+      tmp_path="${2}"
+      shift 2
+    ;;
+    -h|--help)
+      show_help
+      exit 0
+    ;;
+    -*|--*) # unsupported flags
+      echo -e "${BOLD_RED}Error:${END} Unsupported flag $1" >&2
+      echo "Use --help for usage information." >&2
+      exit 1
+    ;;
+    *) # no positional arguments supported
+      echo -e "${BOLD_RED}Error:${END} Unsupported argument $1" >&2
+      echo "Use --help for usage information." >&2
+      exit 1
+    ;;
+  esac
+done
+
+# Validate required parameters
+if [[ -z "${org}" && -z "${user}" ]]; then
+  echo -e "${BOLD_RED}Error:${END} Organization name or user is required. Use -o or --organization to specify an organization, or -u or --user to specify a user." >&2
+  echo "Use --help for usage information." >&2
+  exit 1
+fi
+
+if [[ -z "${token}" ]]; then
+  echo -e "${BOLD_RED}Error:${END} GITHUB_TOKEN environment variable is not set. Please set it to your GitHub personal access token." >&2
+  echo "Use --help for usage information." >&2
+  exit 1
+fi
+
+# Validate S3 bucket configuration
+if [[ -z "${s3_bucket}" ]]; then
+  echo -e "${BOLD_YELLOW}Warning:${END} S3 bucket is not specified. Archive will not be uploaded to S3." >&2
+else
+  if ! command -v aws >/dev/null 2>&1; then
+    echo -e "${BOLD_RED}Error:${END} AWS CLI is not installed. Please install it to upload the archive to S3." >&2
+    exit 1
+  fi
+fi
+
+# Set default values for optional parameters
+target_name="${org:-${user}}"
+archive_name="${archive_name:-${target_name}-gh-archive-${date_suffix}.tar.gz}"
+tmp_path="${tmp_path:-/tmp/${target_name}-gh-archive-${date_suffix}}"
+
+# Validate and create temporary directory
+if [[ -e "${tmp_path}" ]]; then
+  echo -e "${BOLD_RED}Error:${END} Temporary path '${tmp_path}' already exists. Please specify a different path with -t or remove the existing path." >&2
+  exit 1
+fi
+
+fetch_and_clone() {
+  local url="$1"
+  local success=0
+  local git_output=""
+
+  echo -e "${BOLD}Fetching repos from ${url}${END}"
+
+  # Use process substitution to avoid subshell issues
+  while IFS= read -r repo_name; do
+    [[ -n "$repo_name" ]] || continue
+
+    echo -en "${BOLD}Cloning ${BOLD_GREEN}${repo_name}${END}... "
+
+    # Create directory with proper quoting
+    mkdir -p "${repo_name}"
+
+    # Use pushd/popd with proper error handling
+    if ! pushd "${repo_name}" >/dev/null 2>&1; then
+      echo -e "${BOLD_RED}Error: Cannot access directory${END}"
+      continue
+    fi
+
+    # Initialize git repository
+    git init -q
+
+    # Clone repository with proper error handling
+    if git_output=$(git pull -q "https://${token}@github.com/${repo_name}.git" 2>&1); then
+      success=0
+    else
+      success=$?
+    fi
+
+    rm -rf .git
+
+    # Return to previous directory
+    if ! popd >/dev/null 2>&1; then
+      echo -e "${BOLD_RED}Error: Cannot return to parent directory${END}" >&2
+      exit 1
+    fi
+
+    # Handle different error conditions
+    case $success in
+      0)
+        echo -e "${BOLD_GREEN}Success${END}"
+        ;;
+      128)
+        echo -e "${BOLD_YELLOW}Error: Already exists${END}"
+        ;;
+      22)
+        echo -e "${BOLD_RED}Error: Not found${END}"
+        ;;
+      1)
+        echo -e "${BOLD_RED}Error:${END} ${git_output}"
+        ;;
+      *)
+        echo -e "${BOLD_RED}Error (${success}):${END} ${git_output}"
+        ;;
+    esac
+  done < <(
+    curl -H "Authorization: token ${token}" \
+      -s \
+      --fail \
+      --show-error \
+      -X GET \
+      "${url}" | \
+    jq -r '.[].full_name' 2>/dev/null || {
+      echo -e "${BOLD_RED}Error:${END} Failed to fetch repository list from GitHub API" >&2
+      exit 1
+    }
+  )
+
+  # Handle pagination
+  local next_link
+  next_link=$(curl -H "Authorization: token ${token}" \
+    -s \
+    --fail \
+    --show-error \
+    --dump-header - \
+    -X GET \
+    "${url}" 2>/dev/null | \
+    grep -i '^link:' | \
+    grep -Po '(?<=<)[^>]+(?=>;\s*rel="next")' || true)
+
+  if [[ -n "$next_link" ]]; then
+    echo -e "${BOLD}Found next link ${next_link}${END}"
+    fetch_and_clone "${next_link}"
+  fi
+}
+
+
+# Main execution
+main() {
+  local url=
+
+  if [[ -n "${user}" ]]; then
+    url="https://api.github.com/users/${user}/repos?per_page=100"
+    echo -e "${BOLD}Archiving repositories for user: ${BOLD_GREEN}${user}${END}"
+  else
+    url="https://api.github.com/orgs/${org}/repos?per_page=100"
+    echo -e "${BOLD}Archiving repositories for organization: ${BOLD_GREEN}${org}${END}"
+  fi
+
+  echo -e "${BOLD}Cloning repos to ${tmp_path}${END}"
+
+  # Create temporary directory
+  if ! mkdir -p "${tmp_path}"; then
+    echo -e "${BOLD_RED}Error:${END} Cannot create temporary directory '${tmp_path}'" >&2
+    exit 1
+  fi
+
+  # Change to temporary directory
+  if ! pushd "${tmp_path}" >/dev/null 2>&1; then
+    echo -e "${BOLD_RED}Error:${END} Cannot access temporary directory '${tmp_path}'" >&2
+    exit 1
+  fi
+
+  # Fetch and clone repositories
+  fetch_and_clone "${url}"
+
+  # Return to original directory
+  if ! popd >/dev/null 2>&1; then
+    echo -e "${BOLD_RED}Error:${END} Cannot return to original directory" >&2
+    exit 1
+  fi
+
+  echo -e "${BOLD}Archiving repos to ${archive_name}${END}"
+
+  # Create archive with proper error handling
+  if ! tar -czf "./${archive_name}" -C "${tmp_path}" .; then
+    echo -e "${BOLD_RED}Error:${END} Failed to create archive" >&2
+    exit 1
+  fi
+
+  # Upload to S3 if configured
+  if [[ -n "${s3_bucket}" ]]; then
+    echo -e "${BOLD}Sending archive ${archive_name} to s3 bucket ${s3_bucket}${END}"
+    if ! aws s3 cp "./${archive_name}" "${s3_bucket}"; then
+      echo -e "${BOLD_RED}Error:${END} Failed to upload archive to S3" >&2
+      exit 1
+    fi
+    echo -e "${BOLD_GREEN}Successfully uploaded to S3${END}"
+  fi
+
+  echo -e "${BOLD_GREEN}Done!${END} Archive created at ${archive_name}"
+}
+
+# Run main function
+main "$@"
+
