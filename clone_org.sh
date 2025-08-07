@@ -24,7 +24,7 @@ fetch_and_clone () {
   echo "Fetching repos from ${url}"
 
   {
-    curl -s --dump-header /dev/stderr -X GET ${url} 2>&3 | jq -r '.[].full_name' | \
+    curl -H "Authorization: token ${token}" -s --dump-header /dev/stderr -X GET ${url} 2>&3 | jq -r '.[].full_name' | \
     while read repo_name; do
       echo -e "${BOLD_NORMAL}$(printf '%-10s' Start:)"$(printf "%-100s\n" "${repo_name}" | tr " " -)"${END}"
       mkdir -p ${repo_name}
@@ -48,7 +48,7 @@ fetch_and_clone () {
 }
 
 date_suffix=$(date +%s)
-url="https://api.github.com/orgs/${org}/repos?access_token=${token}&per_page=100"
+url="https://api.github.com/orgs/${org}/repos?per_page=100"
 tmp_path="/tmp/${org}-gh-archive-${date_suffix}"
 archive_name="${org}-gh-archive-${date_suffix}.tar.gz"
 
